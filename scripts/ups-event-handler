@@ -1,0 +1,31 @@
+#!/bin/sh
+UPS="bx1600mi-fr@localhost"
+request_shutdown() {
+    logger -t ups-monitor "Requesting privileged UPS shutdown service"
+    if ! /usr/bin/sudo -n /usr/bin/systemctl start ups-emergency-shutdown.service; then
+        logger -t ups-monitor "ERROR: Failed to start UPS shutdown service"
+        exit 1
+    fi
+}
+case "${1:-}" in
+    onbattery)
+        STATUS=$(/usr/bin/upsc "$UPS" ups.status 2>/dev/null) || STATUS=""
+        if printf '%s\n' "$STATUS" | grep -qw OB; then
+            logger -t ups-monitor "CRITICAL: UPS on battery for 60 seconds"
+            request_shutdown
+        else
+            logger -t ups-monitor "Battery timer expired, status recovered: $STATUS"
+        fi
+        ;;
+    commlost)
+        if ! /usr/bin/upsc "$UPS" ups.status >/dev/null 2>&1; then
+            logger -t ups-monitor "CRITICAL: UPS communication lost for 60 seconds"
+            request_shutdown
+        else
+            logger -t ups-monitor "Communication restored, shutdown cancelled"
+        fi
+        ;;
+    *)
+        logger -t ups-monitor "Unknown UPS event: ${1:-<empty>}"
+        ;;
+esac
