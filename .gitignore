@@ -1,0 +1,21 @@
+# Local secrets and private configuration
+.env
+.env.*
+!.env.example
+*.secret
+*.key
+*.pem
+upsd.users
+upsmon.conf
+!config/nut/upsmon.conf.example
+# Runtime / editor files
+*.pid
+*.pipe
+*.lock
+*.log
+killpower
+*~
+*.swp
+.DS_Store
+.idea/
+.vscode/

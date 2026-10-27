@@ -1,0 +1,7 @@
+CMDSCRIPT /usr/local/sbin/ups-event-handler
+PIPEFN /run/nut/upssched.pipe
+LOCKFN /run/nut/upssched.lock
+AT ONBATT * START-TIMER onbattery 60
+AT ONLINE * CANCEL-TIMER onbattery
+AT COMMBAD * START-TIMER commlost 60
+AT COMMOK * CANCEL-TIMER commlost

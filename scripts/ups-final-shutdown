@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+UPS="bx1600mi-fr@localhost"
+LOGGER="/usr/bin/logger"
+UPSC="/usr/bin/upsc"
+# Safe default for repository examples. Production host used false.
+TEST_MODE=true
+log() { "$LOGGER" -t ups-monitor "$1"; }
+unsafe_ups_state() {
+    local status
+    if ! status=$("$UPSC" "$UPS" ups.status 2>/dev/null); then
+        log "WARNING: UPS communication unavailable"
+        return 0
+    fi
+    if [[ -z "$status" ]]; then
+        log "WARNING: Empty UPS status"
+        return 0
+    fi
+    if [[ " $status " == *" OB "* ]]; then
+        log "WARNING: UPS on battery ($status)"
+        return 0
+    fi
+    if [[ " $status " == *" OL "* ]] && [[ " $status " != *" OB "* ]]; then
+        log "INFO: UPS on mains power ($status)"
+        return 1
+    fi
+    log "WARNING: Unexpected UPS status ($status)"
+    return 0
+}
+log "UPS shutdown service invoked"
+if ! unsafe_ups_state; then
+    log "Shutdown cancelled: UPS healthy"
+    exit 0
+fi
+log "UPS unsafe; verifying again in 5 seconds"
+sleep 5
+if ! unsafe_ups_state; then
+    log "Shutdown cancelled: UPS recovered"
+    exit 0
+fi
+log "CRITICAL: UPS unsafe after second verification"
+if [[ "$TEST_MODE" == true ]]; then
+    log "TEST: Privileged shutdown would execute"
+    exit 0
+fi
+log "CRITICAL: Executing system shutdown"
+/usr/sbin/shutdown -h now

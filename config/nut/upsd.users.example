@@ -1,0 +1,4 @@
+# Template only: replace placeholder with a unique secret
+[upsmon_admin]
+    password = REPLACE_WITH_UNIQUE_SECRET
+    upsmon primary
