@@ -1,0 +1,3 @@
+[bx1600mi-fr]
+    driver = usbhid-ups
+    port = auto
