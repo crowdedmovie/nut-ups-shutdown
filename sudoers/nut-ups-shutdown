@@ -1,0 +1,2 @@
+# Validate with visudo -cf /etc/sudoers.d/nut-ups-shutdown
+nut ALL=(root) NOPASSWD: /usr/bin/systemctl start ups-emergency-shutdown.service
