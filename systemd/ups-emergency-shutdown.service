@@ -1,0 +1,8 @@
+[Unit]
+Description=Emergency shutdown requested by UPS monitoring
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/ups-final-shutdown
