@@ -1,0 +1,1 @@
+ups-shutdown ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block poweroff

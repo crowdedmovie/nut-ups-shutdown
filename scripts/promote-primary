@@ -1,0 +1,146 @@
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+[[ ${EUID} -eq 0 ]] || die "Run this script as root."
+[[ $# -eq 0 || ( $# -eq 1 && $1 == --check ) ]] || die "Usage: $0 [--check]"
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+coordinator="$repo/scripts/ups-final-shutdown"
+config_dir=/etc/nut-ups-shutdown
+config="$config_dir/config.env"
+run_dir=/run/nut-ups-shutdown
+
+if [[ ${1:-} == --check ]]; then
+    exec /usr/bin/python3 "$coordinator" preflight --config "$config"
+fi
+
+for program in systemctl visudo upsc upssched flock timeout; do
+    command -v "$program" >/dev/null || die "Missing required command: $program"
+done
+getent group nut >/dev/null || die "Install the Debian nut-server and nut-client packages."
+install -d -m 0700 "$run_dir"
+exec 9>>"$run_dir/dispatch.lock"
+flock -n 9 || die "A shutdown sequence or configuration update is already active."
+[[ ! -e $run_dir/completed && ! -e $run_dir/critical && ! -e /etc/killpower ]] ||
+    die "A shutdown is pending or a NUT powerdown flag is present."
+if systemctl is-active --quiet ups-emergency-shutdown.service; then
+    die "The legacy shutdown service is running."
+fi
+
+work=$(mktemp -d /var/backups/nut-ups-shutdown.XXXXXXXX)
+stage="$work/staged"
+previous="$work/previous"
+mkdir "$stage" "$previous"
+install -m 0600 "$config" "$stage/active.env"
+settings=$(/usr/bin/python3 "$coordinator" settings --config "$stage/active.env")
+read -r ups test_mode <<<"$settings"
+/usr/bin/python3 "$coordinator" preflight --config "$stage/active.env"
+/usr/bin/python3 "$coordinator" render-upssched --config "$stage/active.env" >"$stage/upssched.conf"
+
+/usr/bin/python3 - "$stage" "$repo/config/nut" "$ups" "$test_mode" <<'PY'
+from pathlib import Path
+from secrets import token_hex
+import sys
+
+stage, templates = map(Path, sys.argv[1:3])
+ups, test_mode = sys.argv[3:]
+replacements = {
+    "@UPS_NAME@": ups,
+    "@NUT_PASSWORD@": token_hex(24),
+    "@POWERDOWN_FLAG@": ("# POWERDOWNFLAG omitted in test mode" if test_mode == "true"
+                         else "POWERDOWNFLAG /etc/killpower"),
+    "@LOCAL_FALLBACK@": ("" if test_mode == "true"
+                         else " || /usr/bin/systemctl --no-block poweroff"),
+}
+for name in ("nut.conf", "ups.conf", "upsd.conf", "upsd.users", "upsmon.conf"):
+    content = (templates / (name + ".example")).read_text(encoding="utf-8")
+    for marker, value in replacements.items():
+        content = content.replace(marker, value)
+    (stage / name).write_text(content, encoding="utf-8")
+PY
+visudo -cf "$repo/sudoers/nut-ups-shutdown"
+
+files=("$config_dir/active.env" /etc/nut/{nut.conf,ups.conf,upsd.conf,upsd.users,upsmon.conf,upssched.conf}
+       /usr/local/sbin/{ups-notify,ups-event-handler,ups-final-shutdown}
+       /etc/systemd/system/ups-emergency-shutdown@.service /etc/sudoers.d/nut-ups-shutdown)
+for file in "${files[@]}"; do
+    if [[ -e $file || -L $file ]]; then
+        cp -a --parents -- "$file" "$previous"
+    fi
+done
+monitor_was_active=false
+server_was_active=false
+systemctl is-active --quiet nut-monitor.service && monitor_was_active=true
+systemctl is-active --quiet nut-server.service && server_was_active=true
+
+enumerate_driver() {
+    systemctl restart nut-driver-enumerator.service
+}
+
+restore_on_error() {
+    local status=$?
+    trap - EXIT
+    if (( status == 0 )); then
+        return
+    fi
+    set +e
+    local restored=true
+    systemctl stop nut-monitor.service nut-server.service || restored=false
+    for file in "${files[@]}"; do
+        if [[ -e $previous$file || -L $previous$file ]]; then
+            cp -a --remove-destination -- "$previous$file" "$file" || restored=false
+        else
+            rm -f -- "$file" || restored=false
+        fi
+    done
+    systemctl daemon-reload || restored=false
+    enumerate_driver || restored=false
+    if "$server_was_active"; then
+        systemctl start nut-server.service || restored=false
+    fi
+    if "$monitor_was_active"; then
+        systemctl start nut-monitor.service || restored=false
+    fi
+    printf 'Activation failed. Previous configuration backup: %s (restore completed: %s)\n' \
+        "$previous" "$restored" >&2
+    exit "$status"
+}
+trap restore_on_error EXIT
+
+systemctl stop nut-monitor.service nut-server.service
+if [[ -e /etc/systemd/system/ups-emergency-shutdown@.service ]]; then
+    systemctl stop ups-emergency-shutdown@onbattery.service ups-emergency-shutdown@commlost.service
+fi
+[[ ! -e $run_dir/critical && ! -e /etc/killpower ]] ||
+    die "NUT entered an emergency shutdown during activation."
+install -m 0600 "$stage/active.env" "$config_dir/active.env"
+install -m 0644 "$stage/nut.conf" /etc/nut/nut.conf
+for file in ups.conf upsd.conf upsd.users upsmon.conf upssched.conf; do
+    install -m 0640 -g nut "$stage/$file" "/etc/nut/$file"
+done
+install -m 0755 "$repo/scripts/ups-notify" "$repo/scripts/ups-event-handler" "$coordinator" /usr/local/sbin/
+install -m 0644 "$repo/systemd/ups-emergency-shutdown@.service" /etc/systemd/system/
+install -m 0440 "$repo/sudoers/nut-ups-shutdown" /etc/sudoers.d/
+rm -f -- "$stage/upsd.users" "$stage/upsmon.conf"
+systemctl daemon-reload
+enumerate_driver
+systemctl start nut-driver.target nut-server.service
+
+status=
+for ((attempt = 0; attempt < 15; attempt++)); do
+    status=$(timeout 2 upsc "$ups@127.0.0.1" ups.status 2>/dev/null) || status=
+    case " $status " in
+        *" FSD "*) status= ;;
+        *" OL "*|*" OB "*) break ;;
+        *) status= ;;
+    esac
+    sleep 1
+done
+[[ -n $status ]] || die "Cannot read a live line or battery status from $ups."
+systemctl start nut-monitor.service
+systemctl is-active --quiet nut-monitor.service
+systemctl enable nut.target nut-server.service nut-monitor.service
+printf 'Primary active. UPS status: %s. TEST_MODE=%s. Backup: %s\n' "$status" "$test_mode" "$previous"

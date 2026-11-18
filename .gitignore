@@ -2,6 +2,10 @@
 .env
 .env.*
 !.env.example
+config.env
+active.env
+ssh_key
+known_hosts
 *.secret
 *.key
 *.pem
@@ -16,6 +20,7 @@ upsmon.conf
 killpower
 *~
 *.swp
+__pycache__/
 .DS_Store
 .idea/
 .vscode/
