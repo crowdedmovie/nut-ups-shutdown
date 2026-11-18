@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+/sbin/upssched "$@"
+if [ "${NOTIFYTYPE:-}" = COMMOK ] && [ -n "${UPSNAME:-}" ]; then
+    # NUT may not emit ONBATT again when it reconnects to the same battery state.
+    if status=$(/usr/bin/timeout 3 /usr/bin/upsc "$UPSNAME" ups.status 2>/dev/null); then
+        case " $status " in
+            *" OB "*) NOTIFYTYPE=BATTERY_RECOVERED /sbin/upssched "$@" ;;
+        esac
+    fi
+fi

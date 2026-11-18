@@ -1,47 +1,351 @@
-#!/usr/bin/env bash
-set -euo pipefail
-UPS="bx1600mi-fr@localhost"
-LOGGER="/usr/bin/logger"
-UPSC="/usr/bin/upsc"
-# Safe default for repository examples. Production host used false.
-TEST_MODE=true
-log() { "$LOGGER" -t ups-monitor "$1"; }
-unsafe_ups_state() {
-    local status
-    if ! status=$("$UPSC" "$UPS" ups.status 2>/dev/null); then
-        log "WARNING: UPS communication unavailable"
-        return 0
-    fi
-    if [[ -z "$status" ]]; then
-        log "WARNING: Empty UPS status"
-        return 0
-    fi
-    if [[ " $status " == *" OB "* ]]; then
-        log "WARNING: UPS on battery ($status)"
-        return 0
-    fi
-    if [[ " $status " == *" OL "* ]] && [[ " $status " != *" OB "* ]]; then
-        log "INFO: UPS on mains power ($status)"
-        return 1
-    fi
-    log "WARNING: Unexpected UPS status ($status)"
-    return 0
+#!/usr/bin/python3
+"""Coordinate shutdown on the USB-connected host."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import ipaddress
+import json
+import logging
+import math
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import time
+
+
+CONFIG_DIR = Path("/etc/nut-ups-shutdown")
+ACTIVE_CONFIG = CONFIG_DIR / "active.env"
+RUN_DIR = Path("/run/nut-ups-shutdown")
+SSH_TIMEOUT = 5
+PING_INTERVAL = 2
+PING_MISSES = 3
+LOG = logging.getLogger("ups-shutdown")
+
+DEFAULTS = {
+    "ON_BATTERY_DELAY_SECONDS": "60",
+    "UPS_UNREACHABLE_DELAY_SECONDS": "60",
+    "SHUTDOWN_STEP_TIMEOUT_SECONDS": "180",
+    "SHUTDOWN_TARGETS": "",
+    "SHUTDOWN_ORDER": "",
+    "SHUTDOWN_DEPENDENCIES": "",
+    "TEST_MODE": "true",
 }
-log "UPS shutdown service invoked"
-if ! unsafe_ups_state; then
-    log "Shutdown cancelled: UPS healthy"
-    exit 0
-fi
-log "UPS unsafe; verifying again in 5 seconds"
-sleep 5
-if ! unsafe_ups_state; then
-    log "Shutdown cancelled: UPS recovered"
-    exit 0
-fi
-log "CRITICAL: UPS unsafe after second verification"
-if [[ "$TEST_MODE" == true ]]; then
-    log "TEST: Privileged shutdown would execute"
-    exit 0
-fi
-log "CRITICAL: Executing system shutdown"
-/usr/sbin/shutdown -h now
+REQUIRED = {"UPS_NAME", "PRIMARY_HOST"}
+
+
+def host_name(value):
+    """Canonicalize unscoped IP literals and DNS names."""
+    try:
+        if "%" not in value:
+            address = ipaddress.ip_address(value)
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                address = address.ipv4_mapped
+            return str(address)
+    except ValueError:
+        pass
+    value = value.removesuffix(".").lower()
+    labels = value.split(".")
+    if len(value) > 253 or all(label.isdecimal() for label in labels) or any(
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in labels
+    ):
+        raise ValueError(f"Invalid host or IP address: {value!r}")
+    return value
+
+
+def config_values(path):
+    values = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, separator, raw_value = line.partition("=")
+        key = key.strip()
+        if not separator or key not in DEFAULTS.keys() | REQUIRED or key in values:
+            raise ValueError(f"{path}:{number}: unknown, malformed or duplicate setting")
+        tokens = shlex.split(raw_value, comments=True)
+        if len(tokens) > 1:
+            raise ValueError(f"{path}:{number}: quote values containing spaces")
+        values[key] = tokens[0] if tokens else ""
+    missing = REQUIRED - values.keys()
+    if missing:
+        raise ValueError(f"Missing settings: {', '.join(sorted(missing))}")
+    return DEFAULTS | values
+
+
+@dataclass(frozen=True)
+class Config:
+    ups: str
+    primary: str
+    steps: tuple
+    battery_delay: int
+    unreachable_delay: int
+    step_timeout: int
+    test_mode: bool
+
+    @classmethod
+    def load(cls, path):
+        values = config_values(path)
+        ups = values["UPS_NAME"]
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", ups):
+            raise ValueError("UPS_NAME must use letters, digits, dots, dashes or underscores")
+        primary = host_name(values["PRIMARY_HOST"])
+        targets = [host_name(host) for host in values["SHUTDOWN_TARGETS"].split()]
+        steps = tuple(
+            tuple(host_name(host) for host in step.split(","))
+            for step in values["SHUTDOWN_ORDER"].split()
+        )
+        ordered_hosts = [host for step in steps for host in step]
+        if len(targets) != len(set(targets)) or len(ordered_hosts) != len(set(ordered_hosts)):
+            raise ValueError("Each shutdown target must occur exactly once")
+        if set(targets) != set(ordered_hosts):
+            raise ValueError("SHUTDOWN_ORDER must list every declared shutdown target")
+        addresses = [ipaddress.ip_address(host) for host in targets if ":" in host or
+                     re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", host)]
+        if primary in targets or "localhost" in targets or any(
+            address.is_loopback or address.is_unspecified or address.is_multicast
+            for address in addresses
+        ):
+            raise ValueError("The primary and local-only addresses cannot be SSH targets")
+        positions = {host: index for index, step in enumerate(steps) for host in step}
+        positions[primary] = len(steps)
+        for dependency in values["SHUTDOWN_DEPENDENCIES"].split():
+            pair = [host_name(host) for host in dependency.split(">")]
+            if len(pair) != 2 or any(host not in positions for host in pair):
+                raise ValueError(f"Invalid shutdown dependency: {dependency}")
+            consumer, provider = pair
+            if positions[consumer] >= positions[provider]:
+                raise ValueError(f"{consumer} must stop in an earlier step than {provider}")
+
+        def seconds(key):
+            value = values[key]
+            if not re.fullmatch(r"[0-9]{1,4}", value) or not 1 <= int(value) <= 3600:
+                raise ValueError(f"{key} must be an integer between 1 and 3600")
+            return int(value)
+
+        if values["TEST_MODE"] not in ("true", "false"):
+            raise ValueError("TEST_MODE must be true or false")
+        return cls(ups, primary, steps, seconds("ON_BATTERY_DELAY_SECONDS"),
+                   seconds("UPS_UNREACHABLE_DELAY_SECONDS"),
+                   seconds("SHUTDOWN_STEP_TIMEOUT_SECONDS"), values["TEST_MODE"] == "true")
+
+    @property
+    def ups_address(self):
+        return f"{self.ups}@127.0.0.1"
+
+
+def command(args, timeout, *, quiet_timeout=False):
+    try:
+        return subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        if not quiet_timeout:
+            LOG.warning("%s timed out: %s", args[0], error)
+        return None
+    except OSError as error:
+        LOG.warning("%s failed: %s", args[0], error)
+        return None
+
+
+def ping(host, timeout=1):
+    result = command(["/usr/bin/ping", "-n", "-c", "1", "-W", "1", "--", host],
+                     timeout + 0.1, quiet_timeout=True)
+    if result is not None and result.returncode in (0, 1):
+        return result.returncode == 0
+    return None
+
+
+def ssh(host, action, timeout):
+    result = command([
+        "/usr/bin/ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={CONFIG_DIR / 'known_hosts'}",
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={max(1, math.ceil(timeout))}",
+        "-i", str(CONFIG_DIR / "ssh_key"), "-l", "ups-shutdown",
+        "--", host, action,
+    ], timeout)
+    expected = "ready" if action == "check" else "shutdown queued"
+    if result is not None and result.returncode == 0 and result.stdout.strip() == expected:
+        return True
+    detail = result.stderr.strip() if result is not None else ""
+    LOG.warning("%s: SSH %s unconfirmed%s", host, action, f" ({detail})" if detail else "")
+    return False
+
+
+def check_local_targets(config):
+    if not config.steps:
+        return
+    result = command(["/usr/bin/ip", "-j", "address", "show"], 3)
+    if result is None or result.returncode != 0:
+        raise ValueError("Cannot determine addresses of the primary")
+    local = {host_name(entry["local"]) for interface in json.loads(result.stdout)
+             for entry in interface["addr_info"]}
+    for hosts in config.steps:
+        for host in hosts:
+            try:
+                resolved = {str(ipaddress.ip_address(host))}
+            except ValueError:
+                lookup = command(["/usr/bin/getent", "ahosts", host], SSH_TIMEOUT)
+                if lookup is None or lookup.returncode != 0:
+                    raise ValueError(f"Cannot resolve SSH target: {host}")
+                resolved = {host_name(line.split()[0]) for line in lookup.stdout.splitlines()
+                            if line.strip()}
+            if local & resolved:
+                raise ValueError(f"SSH target {host} resolves to the primary")
+
+
+def preflight(config):
+    check_local_targets(config)
+    success = True
+    for index, step in enumerate(config.steps, 1):
+        LOG.info("Step %s: %s", index, ", ".join(step))
+        for host in step:
+            reachable = ping(host)
+            ready = ssh(host, "check", SSH_TIMEOUT)
+            LOG.info("%s: ICMP %s, SSH %s", host, "ok" if reachable else "unavailable",
+                     "ready" if ready else "failed")
+            success &= ready
+    LOG.info("Final step: local shutdown of %s", config.primary)
+    return success
+
+
+def ups_status(config):
+    result = command(["/usr/bin/upsc", config.ups_address, "ups.status"], 3)
+    if result is None or result.returncode != 0:
+        return set()
+    return set(result.stdout.split())
+
+
+def verify_trigger(config, reason, urgent):
+    for attempt in range(2):
+        if urgent():
+            return True
+        status = ups_status(config)
+        matches = "OB" in status if reason == "onbattery" else not status
+        if not matches:
+            LOG.info("%s cancelled: UPS status %s", reason, " ".join(sorted(status)) or "unavailable")
+            return urgent()
+        if attempt == 0:
+            wait_until = time.monotonic() + 5
+            while time.monotonic() < wait_until and not urgent():
+                time.sleep(0.25)
+    return True
+
+
+def shutdown_step(hosts, timeout, urgent):
+    deadline = time.monotonic() + timeout
+
+    def remaining(limit):
+        return max(0.1, min(limit, deadline - time.monotonic()))
+
+    with ThreadPoolExecutor(max_workers=len(hosts)) as workers:
+        responding = set()
+        if not urgent():
+            baseline = {host: workers.submit(ping, host, remaining(1)) for host in hosts}
+            responding = {host for host, result in baseline.items() if result.result()}
+        attempts = {host: workers.submit(ssh, host, "poweroff", remaining(SSH_TIMEOUT))
+                    for host in hosts}
+        accepted = {host for host, result in attempts.items() if result.result()}
+        for host in sorted(accepted):
+            LOG.info("%s: shutdown queued", host)
+        unconfirmed = set(hosts)
+        misses = dict.fromkeys(responding & accepted, 0)
+        while unconfirmed and time.monotonic() < deadline and not urgent():
+            pending = {host: workers.submit(ping, host, remaining(1)) for host in misses}
+            for host, result in pending.items():
+                misses[host] = misses[host] + 1 if result.result() is False else 0
+                if misses[host] == PING_MISSES:
+                    del misses[host]
+                    unconfirmed.remove(host)
+                    LOG.info("%s: stopped responding to ping after shutdown request", host)
+            next_poll = min(deadline, time.monotonic() + PING_INTERVAL)
+            while unconfirmed and time.monotonic() < next_poll and not urgent():
+                time.sleep(min(0.25, max(0, next_poll - time.monotonic())))
+        if unconfirmed:
+            LOG.warning("Proceeding after %s: shutdown unconfirmed for %s",
+                        "NUT emergency" if urgent() else "step timeout",
+                        ", ".join(sorted(unconfirmed)))
+
+
+def orchestrate(config, reason):
+    import fcntl  # Linux runtime. Configuration validation is platform-independent.
+
+    RUN_DIR.mkdir(mode=0o700, exist_ok=True)
+    urgent_file = RUN_DIR / "critical"
+    completed = RUN_DIR / "completed"
+    critical = reason == "critical"
+    if critical:
+        urgent_file.touch()
+
+    # Native NUT shutdown can shorten a sequence already holding the dispatch lock.
+    with (RUN_DIR / "dispatch.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if completed.exists() or not verify_trigger(config, reason, urgent_file.exists):
+                return True
+            LOG.warning("Shutdown trigger confirmed: %s", reason)
+            if config.test_mode:
+                LOG.info("TEST_MODE: checking targets without sending shutdown orders")
+                result = preflight(config)
+                if urgent_file.exists():
+                    completed.touch()
+                return result
+            for index, step in enumerate(config.steps, 1):
+                LOG.info("Starting shutdown step %s: %s", index, ", ".join(step))
+                shutdown_step(step, config.step_timeout, urgent_file.exists)
+            LOG.warning("Requesting local poweroff of %s", config.primary)
+            result = command(["/usr/bin/systemctl", "--no-block", "poweroff"], 5)
+            if result is None or result.returncode != 0:
+                LOG.error("Local poweroff request failed")
+                return False
+            completed.touch()
+            return True
+        finally:
+            if critical:
+                urgent_file.unlink(missing_ok=True)
+                if config.test_mode:
+                    completed.unlink(missing_ok=True)
+
+
+def render_upssched(config):
+    template = """CMDSCRIPT /usr/local/sbin/ups-event-handler
+PIPEFN /run/nut/upssched.pipe
+LOCKFN /run/nut/upssched.lock
+AT ONBATT * START-TIMER onbattery {battery}
+AT ONLINE * CANCEL-TIMER onbattery
+AT ONLINE * CANCEL-TIMER recovered-battery
+AT COMMBAD * START-TIMER commlost {unreachable}
+AT COMMBAD * CANCEL-TIMER onbattery
+AT COMMBAD * CANCEL-TIMER recovered-battery
+AT COMMOK * CANCEL-TIMER commlost
+AT BATTERY_RECOVERED * START-TIMER recovered-battery {battery}"""
+    print(template.format(battery=config.battery_delay, unreachable=config.unreachable_delay))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("preflight", "settings", "render-upssched",
+                                          "onbattery", "commlost", "critical"))
+    parser.add_argument("--config", type=Path, default=ACTIVE_CONFIG)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    try:
+        config = Config.load(args.config)
+        if args.action == "settings":
+            print(config.ups, str(config.test_mode).lower())
+        elif args.action == "render-upssched":
+            render_upssched(config)
+        elif args.action == "preflight":
+            return 0 if preflight(config) else 1
+        else:
+            return 0 if orchestrate(config, args.action) else 1
+    except (OSError, ValueError) as error:
+        LOG.error("%s", error)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

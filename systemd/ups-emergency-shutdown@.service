@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify and handle UPS shutdown event (%i)
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+User=root
+TimeoutStartSec=infinity
+ExecStart=/usr/local/sbin/ups-final-shutdown %i
